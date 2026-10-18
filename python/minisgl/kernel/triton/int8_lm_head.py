@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -55,6 +57,22 @@ def quantize_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return int8_weight, scale.reshape(-1).contiguous()
 
 
+def _select_tile(m: int) -> Tuple[int, int]:
+    """Pick a tile height that streams the weight matrix once per call.
+
+    The kernel keeps bf16 tensor-core math and only halves the weight bytes, so
+    its speed is decided by how many times the vocabulary matrix is read:
+    ``ceil(m / BLOCK_M)`` passes. Decode batches up to 64 rows fit in one pass;
+    past that the accumulator gets too large and a second pass is cheaper than
+    the register pressure.
+    """
+    if m <= 16:
+        return 16, 4
+    if m <= 32:
+        return 32, 8
+    return 64, 8
+
+
 def int8_lm_head(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -70,7 +88,8 @@ def int8_lm_head(
     """
     m, n = x.shape[0], weight.shape[0]
     logits = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    grid = (triton.cdiv(n, 128), triton.cdiv(m, 16))
+    block_m, num_warps = _select_tile(m)
+    grid = (triton.cdiv(n, 128), triton.cdiv(m, block_m))
     _int8_lm_head_kernel[grid](
         x,
         int8_weight,
@@ -85,10 +104,10 @@ def int8_lm_head(
         int8_weight.stride(1),
         logits.stride(0),
         logits.stride(1),
-        BLOCK_M=16,
+        BLOCK_M=block_m,
         BLOCK_N=128,
         BLOCK_K=64,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=3,
     )
     if refine_k > 0:
